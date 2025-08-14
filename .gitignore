@@ -1,3 +1,5 @@
 rtsp
 
 .env
+
+**/node_modules
