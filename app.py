@@ -38,23 +38,23 @@ class OverlaySchema(Schema):
     y = fields.Float(required=True, validate=lambda y: 0 <= y <= 100)
     width = fields.Float(required=True, validate=lambda x: x > 0)
     height = fields.Float(required=True, validate=lambda x: x > 0)
-    fontSize = fields.Int(missing=16, validate=lambda x: 8 <= x <= 72)
-    color = fields.Str(missing='#ffffff')
-    backgroundColor = fields.Str(missing='rgba(0,0,0,0.5)')
-    borderRadius = fields.Int(missing=0, validate=lambda x: x >= 0)
-    opacity = fields.Float(missing=1.0, validate=lambda x: 0 <= x <= 1)
-    rotation = fields.Float(missing=0)
-    zIndex = fields.Int(missing=1)
-    animation = fields.Str(missing='none', validate=lambda x: x in ['none', 'fade', 'slide', 'bounce'])
-    isVisible = fields.Bool(missing=True)
+    fontSize = fields.Int(load_default=16, validate=lambda x: 8 <= x <= 72)
+    color = fields.Str(load_default='#ffffff')
+    backgroundColor = fields.Str(load_default='rgba(0,0,0,0.5)')
+    borderRadius = fields.Int(load_default=0, validate=lambda x: x >= 0)
+    opacity = fields.Float(load_default=1.0, validate=lambda x: 0 <= x <= 1)
+    rotation = fields.Float(load_default=0)
+    zIndex = fields.Int(load_default=1)
+    animation = fields.Str(load_default='none', validate=lambda x: x in ['none', 'fade', 'slide', 'bounce'])
+    isVisible = fields.Bool(load_default=True)
 
 class StreamSettingsSchema(Schema):
     rtspUrl = fields.Str(required=True)
-    quality = fields.Str(missing='720p', validate=lambda x: x in ['480p', '720p', '1080p'])
-    bitrate = fields.Int(missing=2000, validate=lambda x: 500 <= x <= 10000)
-    frameRate = fields.Int(missing=30, validate=lambda x: 15 <= x <= 60)
-    autoReconnect = fields.Bool(missing=True)
-    bufferSize = fields.Int(missing=3, validate=lambda x: 1 <= x <= 10)
+    quality = fields.Str(load_default='720p', validate=lambda x: x in ['480p', '720p', '1080p'])
+    bitrate = fields.Int(load_default=2000, validate=lambda x: 500 <= x <= 10000)
+    frameRate = fields.Int(load_default=30, validate=lambda x: 15 <= x <= 60)
+    autoReconnect = fields.Bool(load_default=True)
+    bufferSize = fields.Int(load_default=3, validate=lambda x: 1 <= x <= 10)
 
 # Error Handlers
 @app.errorhandler(ValidationError)
@@ -83,18 +83,76 @@ def serialize_doc(doc):
     return doc
 
 def validate_rtsp_url(url):
-    """Validate RTSP URL format and accessibility"""
-    if not url.startswith('rtsp://'):
-        return False, "URL must start with 'rtsp://'"
+    """Validate stream URL with improved error handling and faster timeouts"""
+    if not url or not isinstance(url, str):
+        return False, "Invalid URL format"
     
-    try:
-        # Basic connectivity test
-        cap = cv2.VideoCapture(url)
-        ret = cap.isOpened()
-        cap.release()
-        return ret, "RTSP stream is accessible" if ret else "Cannot connect to RTSP stream"
-    except Exception as e:
-        return False, f"Error testing RTSP connection: {str(e)}"
+    url = url.strip()
+    
+    # Quick format validation
+    if not (url.startswith('rtsp://') or url.startswith('rtmp://') or 
+            url.startswith('http://') or url.startswith('https://')):
+        return False, "URL must start with 'rtsp://', 'rtmp://', 'http://', or 'https://'"
+    
+    # For HTTP/HTTPS URLs (demo videos), do a quick HEAD request
+    if url.startswith('http://') or url.startswith('https://'):
+        try:
+            response = requests.head(url, timeout=3, allow_redirects=True)
+            if response.status_code < 400:
+                return True, f"HTTP stream accessible (Status: {response.status_code})"
+            else:
+                return False, f"HTTP error: {response.status_code}"
+        except requests.RequestException as e:
+            # Try GET request if HEAD fails
+            try:
+                response = requests.get(url, timeout=3, stream=True)
+                response.close()
+                return True, "HTTP stream accessible"
+            except:
+                return False, f"Cannot access HTTP stream: connection failed"
+    
+    # For RTSP/RTMP URLs, try OpenCV with very short timeout
+    if url.startswith('rtsp://') or url.startswith('rtmp://'):
+        try:
+            import signal
+            
+            def timeout_handler(signum, frame):
+                raise TimeoutError("OpenCV timeout")
+            
+            # Set signal alarm for 5 seconds max
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(5)
+            
+            try:
+                cap = cv2.VideoCapture(url)
+                cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000)  # 3 second timeout
+                cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 2000)   # 2 second read timeout
+                
+                ret = cap.isOpened()
+                if ret:
+                    # Try to read one frame to verify it's actually working
+                    frame_ret, frame = cap.read()
+                    cap.release()
+                    signal.alarm(0)  # Cancel alarm
+                    
+                    if frame_ret:
+                        return True, "RTSP stream is accessible and streaming"
+                    else:
+                        return False, "RTSP stream connected but no video data"
+                else:
+                    cap.release()
+                    signal.alarm(0)  # Cancel alarm
+                    return False, "Cannot connect to RTSP stream - check URL, network, and credentials"
+                    
+            except TimeoutError:
+                return False, "RTSP connection timeout - stream may be offline or slow"
+            finally:
+                signal.alarm(0)  # Ensure alarm is cancelled
+                
+        except Exception as e:
+            return False, f"RTSP validation error: {str(e)}"
+    
+    return True, "URL format accepted (validation skipped for this protocol)"
 
 # Stream Management Class
 class StreamManager:
@@ -115,7 +173,7 @@ class StreamManager:
             self.active_streams[stream_id] = {
                 'cap': cap,
                 'rtsp_url': rtsp_url,
-                'start_time': datetime.now(datetime.timezone.utc),
+                'start_time': datetime.utcnow(),
                 'status': 'active'
             }
             
@@ -149,7 +207,7 @@ class StreamManager:
             'status': stream['status'],
             'rtsp_url': stream['rtsp_url'],
             'start_time': stream['start_time'].isoformat(),
-            'uptime': (datetime.now(datetime.timezone.utc) - stream['start_time']).total_seconds(),
+            'uptime': (datetime.utcnow() - stream['start_time']).total_seconds(),
             'stats': stats
         }
 
@@ -164,7 +222,7 @@ def health_check():
         'status': 'healthy',
         'service': 'StreamOverlay API',
         'version': '1.0.0',
-        'timestamp': datetime.now(datetime.timezone.utc).toisoformat()
+        'timestamp': datetime.utcnow().toisoformat()
     })
 
 # Overlay Management Routes
@@ -217,8 +275,8 @@ def create_overlay():
         data = schema.load(request.json)
         
         # Add metadata
-        data['createdAt'] = datetime.now(datetime.timezone.utc)
-        data['updatedAt'] = datetime.now(datetime.timezone.utc)
+        data['createdAt'] = datetime.utcnow()
+        data['updatedAt'] = datetime.utcnow()
         data['version'] = 1
         
         # Insert into database
@@ -255,29 +313,31 @@ def update_overlay(overlay_id):
     """Update an existing overlay"""
     try:
         # Validate input
-        schema = OverlaySchema(partial=True)
-        data = schema.load(request.json)
+        update_data = {}
+        allowed_fields = ['type', 'content', 'x', 'y', 'width', 'height', 'fontSize', 
+                         'color', 'backgroundColor', 'borderRadius', 'opacity', 
+                         'rotation', 'zIndex', 'animation', 'isVisible']
+        
+        for field in allowed_fields:
+            if field in request.json:
+                update_data[field] = request.json[field]
         
         # Add update metadata
-        data['updatedAt'] = datetime.now(datetime.timezone.utc)
+        update_data['updatedAt'] = datetime.utcnow()
         
         # Update in database
         result = mongo.db.overlays.update_one(
             {'_id': ObjectId(overlay_id)},
-            {'$set': data, '$inc': {'version': 1}}
+            {'$set': update_data, '$inc': {'version': 1}}
         )
         
         if result.matched_count == 0:
-            raise NotFound('Overlay not found')
+            return jsonify({'error': 'Overlay not found'}), 404
         
         # Fetch and return updated overlay
         overlay = mongo.db.overlays.find_one({'_id': ObjectId(overlay_id)})
-        
-        logger.info(f"Updated overlay: {overlay_id}")
         return jsonify(serialize_doc(overlay))
-        
-    except ValidationError as e:
-        return jsonify({'error': 'Validation failed', 'messages': e.messages}), 400
+    
     except Exception as e:
         logger.error(f"Error updating overlay {overlay_id}: {str(e)}")
         return jsonify({'error': 'Failed to update overlay'}), 500
@@ -314,7 +374,7 @@ def bulk_update_overlays():
             if op_type == 'update':
                 schema = OverlaySchema(partial=True)
                 validated_data = schema.load(overlay_data)
-                validated_data['updatedAt'] = datetime.now(datetime.timezone.utc)
+                validated_data['updatedAt'] = datetime.utcnow()
                 
                 result = mongo.db.overlays.update_one(
                     {'_id': ObjectId(overlay_id)},
@@ -374,7 +434,7 @@ def start_stream(stream_id):
                 'streamId': stream_id,
                 'rtspUrl': rtsp_url,
                 'status': 'active',
-                'startTime': datetime.now(datetime.timezone.utc),
+                'startTime': datetime.utcnow(),
                 'settings': data.get('settings', {})
             }
             
@@ -402,7 +462,7 @@ def stop_stream(stream_id):
             # Update database
             mongo.db.streams.update_one(
                 {'streamId': stream_id},
-                {'$set': {'status': 'stopped', 'stopTime': datetime.now(datetime.timezone.utc)}}
+                {'$set': {'status': 'stopped', 'stopTime': datetime.utcnow()}}
             )
             
             return jsonify({'message': 'Stream stopped successfully'})
@@ -478,7 +538,7 @@ def update_settings():
     """Update application settings"""
     try:
         data = request.json
-        data['updatedAt'] = datetime.now(datetime.timezone.utc)
+        data['updatedAt'] = datetime.utcnow()
         
         mongo.db.settings.update_one(
             {'type': 'global'},
