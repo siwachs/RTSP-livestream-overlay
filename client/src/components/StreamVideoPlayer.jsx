@@ -182,11 +182,9 @@ const StreamVideoPlayer = ({ rtspUrl, overlays, onOverlayUpdate }) => {
           className="w-full h-full object-contain"
           onPlay={() => {
             setIsPlaying(true);
-            onPlayStateChange(true);
           }}
           onPause={() => {
             setIsPlaying(false);
-            onPlayStateChange(false);
           }}
           src={getPlayableUrl(rtspUrl)}
         />
